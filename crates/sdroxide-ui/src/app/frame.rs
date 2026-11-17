@@ -2354,6 +2354,7 @@ impl SdroxideApp {
             (None, true) => (state.center_hz, stated),
             _ => (state.center_hz, state.sample_rate),
         };
+        let gains = caps.as_ref().map_or(&[][..], |c| c.gains.as_slice());
         let mut sink = crate::input::UiSink {
             view,
             help: &mut help.open,
@@ -2366,6 +2367,7 @@ impl SdroxideApp {
             rig_squelch,
             agc_without_off,
             zoom_out,
+            gains,
         };
         input.poll_pointer_and_keys(ctx, state, &mut sink, cmds);
         #[cfg(not(target_arch = "wasm32"))]
@@ -2410,6 +2412,7 @@ impl SdroxideApp {
             (None, true) => (state.center_hz, stated),
             _ => (state.center_hz, state.sample_rate),
         };
+        let gains = caps.as_ref().map_or(&[][..], |c| c.gains.as_slice());
         let mut sink = crate::input::UiSink {
             view,
             help: &mut help.open,
@@ -2422,6 +2425,7 @@ impl SdroxideApp {
             rig_squelch,
             agc_without_off,
             zoom_out,
+            gains,
         };
         crate::input::apply_action(
             act,
@@ -2503,6 +2507,8 @@ impl SdroxideApp {
             agc_without_off,
             // Releasing held keys never pans or zooms, so the passband will do.
             zoom_out: (state.center_hz, state.sample_rate),
+            // …and never moves a gain stage, so it needs no ranges either.
+            gains: &[],
         };
         input.release_all(state, &mut sink, cmds);
     }

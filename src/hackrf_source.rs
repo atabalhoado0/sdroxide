@@ -250,12 +250,17 @@ impl IqSource for HackRfSource {
     /// The LNA truncates to 8 dB steps and the VGA to 2, so a slider left at
     /// 15 dB is a radio at 8. Reporting the request back would make the UI
     /// disagree with the radio about something the operator can measure.
+    ///
+    /// The bias tee is reported too, like the amp: a MIDI button bound to it
+    /// flips whatever this says, and a controller's LED shows it, so leaving it
+    /// out would make every press read "off" and turn it on.
     fn current_gains(&self) -> Vec<(String, f64)> {
         let (lna, vga, _) = self.handle.gains();
         vec![
             (HackRfConfig::LNA_ELEMENT.to_string(), lna),
             (HackRfConfig::VGA_ELEMENT.to_string(), vga),
             (HackRfConfig::AMP_ELEMENT.to_string(), f64::from(u8::from(self.amp))),
+            (HackRfConfig::BIAS_TEE_ELEMENT.to_string(), f64::from(u8::from(self.bias_tee))),
         ]
     }
 

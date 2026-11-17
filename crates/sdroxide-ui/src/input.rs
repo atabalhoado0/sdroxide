@@ -11,11 +11,51 @@
 use std::collections::HashMap;
 
 use sdroxide_types::{
-    Action, ActionInput, ActionKind, BindingTuning, ButtonMode, Command, InputSettings, KeyChord,
-    MAX_MANUAL_GAIN_DB, MouseButton, RadioState, RxId, SQUELCH_CLOSED_DB, SQUELCH_OPEN_DB, Vfo,
+    Action, ActionInput, ActionKind, BindingTuning, ButtonMode, Command, Direction, GainElement,
+    InputSettings, KeyChord, MAX_MANUAL_GAIN_DB, MouseButton, RadioState, RxId, SQUELCH_CLOSED_DB,
+    SQUELCH_OPEN_DB, Vfo,
 };
 
 use crate::view::ViewState;
+
+/// The pseudo gain-element names the LNA, VGA and bias-tee actions ride on.
+///
+/// The HackRF's are `HackRfConfig::{LNA,VGA,BIAS_TEE}_ELEMENT`, and several
+/// other backends (RTL-SDR, Airspy, RX-888) spell the bias tee the same way, so
+/// the one action is not tied to a single radio. A radio without the stage
+/// either does not list it in `DeviceCaps::gains` — and the continuous actions
+/// then do nothing — or ignores the unknown name. Note that the bias-tee button
+/// can only read its state back from a backend that reports `BIASTEE` in
+/// `current_gains`, which today is the HackRF's.
+const LNA_ELEMENT: &str = "LNA";
+const VGA_ELEMENT: &str = "VGA";
+const BIAS_TEE_ELEMENT: &str = "BIASTEE";
+
+/// The receive gain stage a continuous gain action drives, as the device
+/// published it — which is where its range and step come from.
+fn gain_stage<'a>(gains: &'a [GainElement], act: Action) -> Option<&'a GainElement> {
+    let name = match act {
+        Action::LnaGain => LNA_ELEMENT,
+        Action::VgaGain => VGA_ELEMENT,
+        _ => return None,
+    };
+    gains.iter().find(|g| g.direction == Direction::Rx && g.name == name)
+}
+
+/// What the radio last said this gain element is at.
+fn gain_now(state: &RadioState, name: &str) -> Option<f64> {
+    state.gains.iter().find(|(n, _)| n == name).map(|(_, db)| *db)
+}
+
+/// Write a gain into the local state ahead of the engine's echo, so a knob
+/// tracks a fast spin instead of waiting on a round trip. The engine's answer
+/// overwrites it with what the hardware really applied.
+fn echo_gain(state: &mut RadioState, name: &str, db: f64) {
+    match state.gains.iter_mut().find(|(n, _)| n == name) {
+        Some((_, d)) => *d = db,
+        None => state.gains.push((name.to_string(), db)),
+    }
+}
 
 /// Gap after which a control counts as newly grabbed, so acceleration starts
 /// from rest instead of inheriting the last burst's rate.
@@ -61,6 +101,10 @@ pub(crate) struct UiSink<'a> {
     /// lane, which this module has no other reason to know about, and off the
     /// same `self` this sink has already taken apart.
     pub zoom_out: (f64, f64),
+    /// The gain stages the radio lists — `DeviceCaps::gains` — so a bound LNA
+    /// or VGA knob moves in the stage's own steps and across its own range.
+    /// Empty before the radio has said what it has.
+    pub gains: &'a [GainElement],
 }
 
 /// Which binding table an in-flight momentary press came from. Held state is
@@ -109,10 +153,20 @@ impl TickAccum {
 ///
 /// `rig_squelch` is [`UiSink::rig_squelch`]: the SQL action has two scales, and
 /// which one a fader spans has to match the one the arm below writes.
-fn absolute_range(act: Action, state: &RadioState, rig_squelch: bool) -> Option<(f32, f32)> {
+fn absolute_range(
+    act: Action,
+    state: &RadioState,
+    rig_squelch: bool,
+    gains: &[GainElement],
+) -> Option<(f32, f32)> {
     use Action::*;
     Some(match act {
         Volume | SubVolume | TxDrive | TuneDrive | MicGain => (0.0, 1.0),
+        // The stage's own span, so a fader's top is the stage's top.
+        LnaGain | VgaGain => {
+            let g = gain_stage(gains, act)?;
+            (g.min_db as f32, g.max_db as f32)
+        }
         // dBFS for the engine's own gate, and the rig's own `0..1` where the
         // radio is the one squelching.
         Squelch if rig_squelch => (0.0, 1.0),
@@ -157,7 +211,7 @@ pub(crate) fn apply_action(
         // Resolve an absolute position into this action's range up front, so
         // each arm below only has to deal with "here is the new value".
         let target = abs.and_then(|p| {
-            absolute_range(act, state, ui.rig_squelch).map(|(lo, hi)| lo + p * (hi - lo))
+            absolute_range(act, state, ui.rig_squelch, ui.gains).map(|(lo, hi)| lo + p * (hi - lo))
         });
         if abs.is_some() && target.is_none() {
             return;
@@ -268,6 +322,34 @@ pub(crate) fn apply_action(
                 state.rx[0].agc_max_gain_db = db;
                 cmds.push(Command::SetAgcMaxGain { rx, db });
             }
+            // The front end's own stages. They move in whole steps of the
+            // stage: the HackRF truncates its LNA to 8 dB and its VGA to 2, so
+            // a one-dB tick added to a stage sitting on a step would round
+            // straight back to where it was and the knob would never move.
+            LnaGain | VgaGain => {
+                let Some(g) = gain_stage(ui.gains, act) else { return };
+                let step = if g.step_db > 0.0 { g.step_db } else { 1.0 };
+                let cur = gain_now(state, &g.name).unwrap_or(g.min_db);
+                let db = match target {
+                    // A fader lands on the nearest step, not between two.
+                    Some(t) => g.min_db + ((f64::from(t) - g.min_db) / step).round() * step,
+                    None => {
+                        let n = (f64::from(delta) / step).round();
+                        // A tick smaller than a step still moves one step.
+                        let n =
+                            if n == 0.0 && delta != 0.0 { f64::from(delta).signum() } else { n };
+                        cur + if n.is_nan() { 0.0 } else { n * step }
+                    }
+                }
+                .clamp(g.min_db, g.max_db);
+                // Already there (the end of the range, or a fader jittering
+                // inside one step): nothing to send, nothing to write to disk.
+                if (db - cur).abs() > f64::EPSILON {
+                    let name = g.name.clone();
+                    echo_gain(state, &name, db);
+                    cmds.push(Command::SetGain { dir: Direction::Rx, element: name, db });
+                }
+            }
             TxDrive => {
                 let v = target.unwrap_or(state.tx.drive + delta).clamp(0.0, 1.0);
                 state.tx.drive = v;
@@ -357,6 +439,19 @@ pub(crate) fn apply_action(
             cmds.push(Command::SetNoiseReduction { rx, level: state.rx[0].noise_reduction.next() })
         }
         AutoNotch => cmds.push(Command::SetAutoNotch { rx, on: !state.rx[0].auto_notch }),
+        // Not a gain, but it rides `SetGain` like the HackRF's other switches
+        // (see `HackRfConfig::BIAS_TEE_ELEMENT`), so it needs no `Command` of
+        // its own. The current state is read back from the radio's own report
+        // rather than kept here, so two presses in a row always undo each other.
+        BiasTee => {
+            let want = gain_now(state, BIAS_TEE_ELEMENT).unwrap_or(0.0) < 0.5;
+            echo_gain(state, BIAS_TEE_ELEMENT, f64::from(u8::from(want)));
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: BIAS_TEE_ELEMENT.to_string(),
+                db: f64::from(u8::from(want)),
+            });
+        }
         // Only where the mode has it: in every other mode the chip is not
         // drawn, and a binding that toggled a hidden setting would change what
         // CW came back to without saying so — the same rule the AGC follows
@@ -985,7 +1080,7 @@ impl InputRuntime {
             .iter()
             .filter(|b| b.enabled && b.feedback)
             .filter_map(|b| {
-                indicator(b.action, state, ui.view)
+                indicator(b.action, state, ui.view, ui.gains)
                     .map(|value| sdroxide_midi::Feedback { msg: b.msg, value })
             })
             .collect();
@@ -1085,11 +1180,28 @@ fn midi_config(cfg: &InputSettings) -> sdroxide_midi::MidiConfig {
 /// The 0..=127 value to echo back to a controller for this action, or `None`
 /// where there is nothing meaningful to show.
 #[cfg(not(target_arch = "wasm32"))]
-fn indicator(act: Action, state: &RadioState, view: &ViewState) -> Option<u8> {
+fn indicator(
+    act: Action,
+    state: &RadioState,
+    view: &ViewState,
+    gains: &[GainElement],
+) -> Option<u8> {
     use Action::*;
     let on = |b: bool| Some(if b { 127u8 } else { 0 });
     let frac = |v: f32| Some((v.clamp(0.0, 1.0) * 127.0).round() as u8);
     match act {
+        // Where the stage sits in its own range, so a motor fader or an LED
+        // ring follows the knob and the radio's own rounding to a step.
+        LnaGain | VgaGain => {
+            let g = gain_stage(gains, act)?;
+            let span = g.max_db - g.min_db;
+            if span <= 0.0 {
+                return None;
+            }
+            let now = gain_now(state, &g.name)?;
+            frac(((now - g.min_db) / span) as f32)
+        }
+        BiasTee => on(gain_now(state, BIAS_TEE_ELEMENT).unwrap_or(0.0) >= 0.5),
         Ptt => on(state.tx.ptt),
         TuneCarrier => on(state.tx.tune),
         Mute => on(state.rx[0].muted),
@@ -1190,7 +1302,160 @@ mod tests {
             // used to read straight off it. A test about the clamp itself sets
             // this after building the sink.
             zoom_out: (0.0, 0.0),
+            // A test about a gain stage lends the ranges after building the sink.
+            gains: &[],
         }
+    }
+
+    /// The HackRF's two receive stages, as `hackrf_caps` publishes them.
+    fn hackrf_gains() -> Vec<GainElement> {
+        vec![
+            GainElement::db("LNA", Direction::Rx, 0.0, 40.0, 8.0),
+            GainElement::db("VGA", Direction::Rx, 0.0, 62.0, 2.0),
+        ]
+    }
+
+    fn sent_gain(cmds: &[Command]) -> Vec<(String, f64)> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                Command::SetGain { dir: Direction::Rx, element, db } => {
+                    Some((element.clone(), *db))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One detent is one *step* of the stage. A one-dB tick on a stage the
+    /// hardware truncates to 8 dB would otherwise round straight back and the
+    /// knob would never move.
+    #[test]
+    fn lna_tick_moves_one_hardware_step() {
+        let gains = hackrf_gains();
+        let mut state = RadioState { gains: vec![("LNA".into(), 16.0)], ..RadioState::default() };
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        ui.gains = &gains;
+        let mut cmds = Vec::new();
+        let up = ActionInput::Delta { d: 1.0, step: 1.0 };
+        apply_action(Action::LnaGain, up, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
+        assert_eq!(sent_gain(&cmds), vec![("LNA".to_string(), 24.0)]);
+        // Echoed locally, so a second tick in the same frame carries on from it.
+        assert_eq!(state.gains, vec![("LNA".to_string(), 24.0)]);
+        let down = ActionInput::Delta { d: -1.0, step: 1.0 };
+        apply_action(Action::LnaGain, down, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
+        apply_action(Action::LnaGain, down, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
+        assert_eq!(state.gains, vec![("LNA".to_string(), 8.0)]);
+    }
+
+    /// At the end of the range there is nothing to send.
+    #[test]
+    fn gain_stops_at_the_ends_of_its_range() {
+        let gains = hackrf_gains();
+        let mut state = RadioState { gains: vec![("VGA".into(), 62.0)], ..RadioState::default() };
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        ui.gains = &gains;
+        let mut cmds = Vec::new();
+        let up = ActionInput::Delta { d: 2.0, step: 2.0 };
+        apply_action(Action::VgaGain, up, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
+        assert!(cmds.is_empty());
+        assert_eq!(state.gains, vec![("VGA".to_string(), 62.0)]);
+    }
+
+    /// A fader spans the stage's own range and lands on a step.
+    #[test]
+    fn vga_fader_spans_the_stage_and_snaps_to_a_step() {
+        let gains = hackrf_gains();
+        let mut state = RadioState::default();
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        ui.gains = &gains;
+        let mut cmds = Vec::new();
+        // 0.25 of 0..62 is 15.5 dB, which is between two 2 dB steps: it lands on
+        // the nearer one (16), not on the raw figure the hardware would truncate.
+        for p in [1.0_f32, 0.25] {
+            apply_action(
+                Action::VgaGain,
+                ActionInput::Absolute(p),
+                ButtonMode::Momentary,
+                &mut state,
+                &mut ui,
+                &mut cmds,
+            );
+        }
+        assert_eq!(sent_gain(&cmds), vec![("VGA".to_string(), 62.0), ("VGA".to_string(), 16.0)]);
+    }
+
+    /// A radio that does not list the stage ignores the knob.
+    #[test]
+    fn gain_action_without_the_stage_does_nothing() {
+        let mut state = RadioState::default();
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        let mut cmds = Vec::new();
+        let up = ActionInput::Delta { d: 1.0, step: 1.0 };
+        apply_action(Action::LnaGain, up, ButtonMode::Momentary, &mut state, &mut ui, &mut cmds);
+        apply_action(
+            Action::VgaGain,
+            ActionInput::Absolute(1.0),
+            ButtonMode::Momentary,
+            &mut state,
+            &mut ui,
+            &mut cmds,
+        );
+        assert!(cmds.is_empty());
+    }
+
+    /// Two presses undo each other, and the second reads what the first set.
+    #[test]
+    fn bias_tee_flips_on_each_press() {
+        let mut state = RadioState::default();
+        let mut view = ViewState::default();
+        let mut flags = [false; 6];
+        let mut speech_acts = Vec::new();
+        let mut ui = sink(&mut view, &mut flags, &mut speech_acts);
+        let mut cmds = Vec::new();
+        for _ in 0..2 {
+            apply_action(
+                Action::BiasTee,
+                ActionInput::Press,
+                ButtonMode::Toggle,
+                &mut state,
+                &mut ui,
+                &mut cmds,
+            );
+        }
+        assert_eq!(
+            sent_gain(&cmds),
+            vec![("BIASTEE".to_string(), 1.0), ("BIASTEE".to_string(), 0.0)]
+        );
+    }
+
+    /// The LED follows the radio's own report, not the last press.
+    #[test]
+    fn bias_tee_and_gain_feedback_follow_the_radio() {
+        let gains = hackrf_gains();
+        let view = ViewState::default();
+        let mut state = RadioState {
+            gains: vec![("BIASTEE".into(), 1.0), ("LNA".into(), 40.0), ("VGA".into(), 0.0)],
+            ..RadioState::default()
+        };
+        assert_eq!(indicator(Action::BiasTee, &state, &view, &gains), Some(127));
+        assert_eq!(indicator(Action::LnaGain, &state, &view, &gains), Some(127));
+        assert_eq!(indicator(Action::VgaGain, &state, &view, &gains), Some(0));
+        state.gains[0].1 = 0.0;
+        assert_eq!(indicator(Action::BiasTee, &state, &view, &gains), Some(0));
+        // Nothing to show for a stage the radio does not have.
+        assert_eq!(indicator(Action::LnaGain, &state, &view, &[]), None);
     }
 
     /// A relative tune must move the local state immediately (the optimistic

@@ -34,6 +34,12 @@ pub enum Action {
     AgcMaxGain,
     /// Fixed audio gain, in effect while the AGC is off.
     ManualGain,
+    /// The front end's `LNA` gain stage (HackRF: 0–40 dB in 8 dB steps). Moves
+    /// in whole steps of the stage, and does nothing on a radio that has none.
+    LnaGain,
+    /// The front end's `VGA` (baseband) gain stage (HackRF: 0–62 dB in 2 dB
+    /// steps). Same rules as [`Action::LnaGain`].
+    VgaGain,
     TxDrive,
     TuneDrive,
     MicGain,
@@ -55,6 +61,10 @@ pub enum Action {
     AutoNotch,
     /// Binaural (pseudo-stereo) audio — see [`crate::Mode::binaural_audio`].
     Binaural,
+    /// Bias tee on the antenna port — DC for a remote LNA. Flips on press, and
+    /// reads its current state back from the radio, so a controller LED follows
+    /// the real switch rather than the last press.
+    BiasTee,
     AgcCycle,
     SubRx,
     Split,
@@ -133,10 +143,9 @@ impl Action {
         use Action::*;
         match self {
             Tune | RitOffset | XitOffset | Volume | SubVolume | Squelch | FilterWidth
-            | FilterShift | AgcMaxGain | ManualGain | TxDrive | TuneDrive | MicGain
-            | DigiAudioFreq | SpectrumZoom | SpectrumPan | SpectrumFloorDb | SpectrumCeilDb => {
-                ActionKind::Continuous
-            }
+            | FilterShift | AgcMaxGain | ManualGain | LnaGain | VgaGain | TxDrive | TuneDrive
+            | MicGain | DigiAudioFreq | SpectrumZoom | SpectrumPan | SpectrumFloorDb
+            | SpectrumCeilDb => ActionKind::Continuous,
             _ => ActionKind::Momentary,
         }
     }
@@ -149,8 +158,9 @@ impl Action {
             | VfoSelect(_) | VfoToggle | SwapVfos | CopyAtoB | Split | BandUp | BandDown
             | BandSelect(_) | MemoryRecall(_) => "Tuning",
             Volume | SubVolume | Squelch | FilterWidth | FilterShift | AgcMaxGain | ManualGain
-            | Mute | NoiseBlanker | NoiseReductionCycle | AutoNotch | Binaural | AgcCycle
-            | SubRx | ModeNext | ModePrev | ModeSelect(_) | RecordToggle => "Receive",
+            | LnaGain | VgaGain | BiasTee | Mute | NoiseBlanker | NoiseReductionCycle
+            | AutoNotch | Binaural | AgcCycle | SubRx | ModeNext | ModePrev | ModeSelect(_)
+            | RecordToggle => "Receive",
             Ptt | TuneCarrier | TxDrive | TuneDrive | MicGain | DigiAudioFreq | AbortTx
             | CwStraight | VoicePlay(_) | VoiceStop | ToneBurst => "Transmit",
             SpectrumZoom | SpectrumPan | SpectrumFloorDb | SpectrumCeilDb | FitSpan | ZoomIn
@@ -176,6 +186,8 @@ impl Action {
             FilterShift => "Filter shift",
             AgcMaxGain => "AGC max gain",
             ManualGain => "Manual gain (AGC off)",
+            LnaGain => "LNA gain",
+            VgaGain => "VGA gain",
             TxDrive => "TX drive",
             TuneDrive => "Tune drive",
             MicGain => "Mic gain",
@@ -191,6 +203,7 @@ impl Action {
             NoiseReductionCycle => "Noise reduction (cycle)",
             AutoNotch => "Auto notch",
             Binaural => "Binaural audio",
+            BiasTee => "Bias tee",
             AgcCycle => "AGC (cycle)",
             SubRx => "Sub receiver",
             Split => "Split",
@@ -246,6 +259,11 @@ impl Action {
             FilterWidth | FilterShift => 50.0,
             Volume | SubVolume | TxDrive | TuneDrive | MicGain => 0.02,
             Squelch | AgcMaxGain | ManualGain | SpectrumFloorDb | SpectrumCeilDb => 1.0,
+            // One detent is one step of the stage (HackRF: 8 dB LNA, 2 dB VGA).
+            // The step is also what the input handler rounds to, so these only
+            // set what a freshly bound encoder starts with.
+            LnaGain => 8.0,
+            VgaGain => 2.0,
             SpectrumZoom => 0.05,
             SpectrumPan => 0.02,
             _ => 1.0,
@@ -267,6 +285,8 @@ impl Action {
             FilterShift,
             AgcMaxGain,
             ManualGain,
+            LnaGain,
+            VgaGain,
             TxDrive,
             TuneDrive,
             MicGain,
@@ -282,6 +302,7 @@ impl Action {
             NoiseReductionCycle,
             AutoNotch,
             Binaural,
+            BiasTee,
             AgcCycle,
             SubRx,
             Split,
